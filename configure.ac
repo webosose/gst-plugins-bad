@@ -1197,6 +1197,15 @@ AG_GST_CHECK_FEATURE(CHROMAPRINT, [chromaprint], chromaprint, [
 ])
 
 dnl *** Curl ***
+AC_ARG_ENABLE([libssh2],
+     [  --enable-libssh2		enable LIBSSH2 support @<:@default=auto@:>@],
+     [case "${enableval}" in
+       yes)  NEED_SSH2=yes ;;
+       no)   NEED_SSH2=no ;;
+       auto) NEED_SSH2=auto ;;
+       *) AC_MSG_ERROR([bad value ${enableval} for --enable-libssh2]) ;;
+     esac],[NEED_SSH2=auto])
+
 translit(dnm, m, l) AM_CONDITIONAL(USE_CURL, true)
 AG_GST_CHECK_FEATURE(CURL, [Curl plugin], curl, [
   PKG_CHECK_MODULES(CURL, libcurl >= 7.35.0, [
@@ -1219,12 +1228,14 @@ AG_GST_CHECK_FEATURE(CURL, [Curl plugin], curl, [
   ])
   AC_SUBST(CURL_CFLAGS)
   AC_SUBST(CURL_LIBS)
-  PKG_CHECK_MODULES(SSH2, libssh2 >= 1.4.3, [
-    HAVE_SSH2="yes"
-    AC_DEFINE(HAVE_SSH2, 1, [Define if libssh2 is available])
-  ], [
-    HAVE_SSH2="no"
-  ])
+  if test "x$NEED_SSH2" != "xno"; then
+    PKG_CHECK_MODULES(SSH2, libssh2 >= 1.4.3, [
+      HAVE_SSH2="yes"
+      AC_DEFINE(HAVE_SSH2, 1, [Define if libssh2 is available])
+    ], [
+      HAVE_SSH2="no"
+    ])
+  fi
   AM_CONDITIONAL(USE_SSH2, test "x$HAVE_SSH2" = "xyes")
   AC_SUBST(SSH2_CFLAGS)
   AC_SUBST(SSH2_LIBS)
