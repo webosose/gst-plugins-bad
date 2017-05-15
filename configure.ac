@@ -1329,7 +1329,7 @@ AG_GST_CHECK_FEATURE(WAYLAND, [wayland sink], wayland , [
   PKG_CHECK_MODULES(WAYLAND, wayland-client >= 1.4.0 libdrm >= 2.4.55 wayland-protocols >= 1.4, [
     if test "x$wayland_scanner" != "x"; then
       HAVE_WAYLAND="yes"
-      AC_SUBST(WAYLAND_PROTOCOLS_DATADIR, `$PKG_CONFIG --variable=pkgdatadir wayland-protocols`)
+      AC_SUBST(WAYLAND_PROTOCOLS_DATADIR, ${WAYLAND_PROTOCOLS_SYSROOT_DIR}`$PKG_CONFIG --variable=pkgdatadir wayland-protocols`)
     else
       AC_MSG_RESULT([wayland-scanner is required to build the wayland plugin])
       HAVE_WAYLAND="no"
