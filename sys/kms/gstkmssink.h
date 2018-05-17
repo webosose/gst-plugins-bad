@@ -72,6 +72,7 @@ struct _GstKMSSink {
   GstAllocator *allocator;
   GstBuffer *last_buffer;
   GstMemory *tmp_kmsmem;
+  GstVideoFrame outframe;
 
   gchar *devname;
   gchar *bus_id;

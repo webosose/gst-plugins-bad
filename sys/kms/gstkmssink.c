@@ -58,6 +58,8 @@
 #include "gstkmsbufferpool.h"
 #include "gstkmsallocator.h"
 
+#define INTERWORK_AVOUTPUTD
+
 #define GST_PLUGIN_NAME "kmssink"
 #define GST_PLUGIN_DESC "Video sink using the Linux kernel mode setting API"
 
@@ -92,6 +94,10 @@ enum
 };
 
 static GParamSpec *g_properties[PROP_N] = { NULL, };
+
+static gint64 old_time = 0;
+static gint frame_cnt_in_sec;
+static gint set_plane_count = 0;
 
 static void
 gst_kms_sink_set_render_rectangle (GstVideoOverlay * overlay,
@@ -778,6 +784,10 @@ gst_kms_sink_stop (GstBaseSink * bsink)
   if (self->allocator)
     gst_kms_allocator_clear_cache (self->allocator);
 
+#ifdef INTERWORK_AVOUTPUTD
+  gst_video_frame_unmap (&self->outframe);
+#endif
+
   gst_buffer_replace (&self->last_buffer, NULL);
   gst_caps_replace (&self->allowed_caps, NULL);
   gst_object_replace ((GstObject **) & self->pool, NULL);
@@ -1310,6 +1320,18 @@ gst_kms_sink_copy_to_dumb_buffer (GstKMSSink * self, GstBuffer * inbuf)
   if (ret != GST_FLOW_OK)
     goto create_buffer_failed;
 
+#ifdef INTERWORK_AVOUTPUTD
+  if (!gst_video_frame_map (&inframe, &self->vinfo, inbuf, GST_MAP_READ))
+    goto error_map_src_buffer;
+
+  if( set_plane_count < 1) {
+    if (!gst_video_frame_map (&self->outframe, &self->vinfo, buf, GST_MAP_WRITE))
+      goto error_map_dst_buffer;
+  }
+
+  success = gst_video_frame_copy (&self->outframe, &inframe);
+  gst_video_frame_unmap (&inframe);
+#else
   if (!gst_video_frame_map (&inframe, &self->vinfo, inbuf, GST_MAP_READ))
     goto error_map_src_buffer;
 
@@ -1319,6 +1341,7 @@ gst_kms_sink_copy_to_dumb_buffer (GstKMSSink * self, GstBuffer * inbuf)
   success = gst_video_frame_copy (&outframe, &inframe);
   gst_video_frame_unmap (&outframe);
   gst_video_frame_unmap (&inframe);
+#endif
   if (!success)
     goto error_copy_buffer;
 
@@ -1401,6 +1424,7 @@ gst_kms_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
   GstVideoRectangle dst = { 0, };
   GstVideoRectangle result;
   GstFlowReturn res;
+  gint64 cur_time = 0;
 
   self = GST_KMS_SINK (vsink);
 
@@ -1420,6 +1444,17 @@ gst_kms_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
   if (fb_id == 0)
     goto buffer_invalid;
 
+  /* For display fps */
+  frame_cnt_in_sec++;
+
+  cur_time = g_get_monotonic_time();
+
+  if( cur_time/1000000 != old_time/1000000 ) {
+    GST_INFO_OBJECT (self, "fps: %d", frame_cnt_in_sec);
+    frame_cnt_in_sec = 0;
+  }
+  old_time = cur_time;
+
   GST_TRACE_OBJECT (self, "displaying fb %d", fb_id);
 
   GST_OBJECT_LOCK (self);
@@ -1428,6 +1463,15 @@ gst_kms_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
     goto sync_frame;
   }
 
+#ifdef INTERWORK_AVOUTPUTD
+  if( set_plane_count < 1 ) {
+    ret = drmModeObjectSetProperty(self->fd, self->plane_id, DRM_MODE_OBJECT_PLANE, 0xff01, fb_id);
+    if (ret) {
+      goto set_plane_failed;
+    }
+    set_plane_count++;
+  }
+#else
   if ((crop = gst_buffer_get_video_crop_meta (buffer))) {
     GstVideoInfo vinfo = self->vinfo;
     vinfo.width = crop->width;
@@ -1493,13 +1537,16 @@ retry_set_plane:
     }
     goto set_plane_failed;
   }
+#endif
 
 sync_frame:
+#ifndef INTERWORK_AVOUTPUTD
   /* Wait for the previous frame to complete redraw */
   if (!gst_kms_sink_sync (self)) {
     GST_OBJECT_UNLOCK (self);
     goto bail;
   }
+#endif
 
   if (buffer != self->last_buffer)
     gst_buffer_replace (&self->last_buffer, buffer);
