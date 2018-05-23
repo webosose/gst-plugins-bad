@@ -95,10 +95,6 @@ enum
 
 static GParamSpec *g_properties[PROP_N] = { NULL, };
 
-static gint64 old_time = 0;
-static gint frame_cnt_in_sec;
-static gint set_plane_count = 0;
-
 static void
 gst_kms_sink_set_render_rectangle (GstVideoOverlay * overlay,
     gint x, gint y, gint width, gint height)
@@ -621,7 +617,8 @@ gst_kms_sink_start (GstBaseSink * bsink)
   if (!conn)
     goto connector_failed;
 
-  crtc = find_crtc_for_connector (self->fd, res, conn, &self->pipe);
+  self->saved_crtc = find_crtc_for_connector (self->fd, res, conn, &self->pipe);
+  crtc = self->saved_crtc;
   if (!crtc)
     goto crtc_failed;
 
@@ -693,8 +690,11 @@ bail:
     drmModeFreePlane (plane);
   if (pres)
     drmModeFreePlaneResources (pres);
+// will be used to resotre crtc
+#if 0
   if (crtc)
     drmModeFreeCrtc (crtc);
+#endif
   if (conn)
     drmModeFreeConnector (conn);
   if (res)
@@ -775,17 +775,66 @@ allowed_caps_failed:
 }
 
 static gboolean
+restore_saved_crtc (GstBaseSink * bsink)
+{
+  GstKMSSink *self;
+  gboolean ret;
+  int err;
+  gint i;
+  guint32 fb_id;
+
+  self = GST_KMS_SINK (bsink);
+
+  if (!self->saved_crtc) {
+     GST_ERROR_OBJECT (self, "BK] saved_crtc is NULL");
+
+    return FALSE;
+  }
+  ret = FALSE;
+
+  if (self->conn_id < 0)
+    goto bail;
+
+  err = drmModeSetCrtc (self->fd, self->saved_crtc->crtc_id, self->saved_crtc->buffer_id, self->saved_crtc->x, self->saved_crtc->y,
+    (uint32_t *) & self->conn_id, 1, & self->saved_crtc->mode);
+
+  if (err)
+    goto modesetting_failed;
+
+  ret = TRUE;
+
+bail:
+  if (self->saved_crtc) {
+    drmModeFreeCrtc (self->saved_crtc);
+    self->saved_crtc = NULL;
+  }
+
+  return ret;
+
+  /* ERRORS */
+modesetting_failed:
+  {
+    GST_ERROR_OBJECT (self, "Failed to set mode: %s", strerror (errno));
+    goto bail;
+  }
+}
+
+static gboolean
 gst_kms_sink_stop (GstBaseSink * bsink)
 {
   GstKMSSink *self;
 
   self = GST_KMS_SINK (bsink);
 
+  if (self->saved_crtc && self->modesetting_enabled)
+    restore_saved_crtc (self);
+
   if (self->allocator)
     gst_kms_allocator_clear_cache (self->allocator);
 
 #ifdef INTERWORK_AVOUTPUTD
-  gst_video_frame_unmap (&self->outframe);
+  if (!self->modesetting_enabled)
+    gst_video_frame_unmap (&self->outframe);
 #endif
 
   gst_buffer_replace (&self->last_buffer, NULL);
@@ -1172,10 +1221,19 @@ gst_kms_sink_sync (GstKMSSink * self)
     if (ret)
       goto vblank_failed;
   } else {
-    ret = drmModePageFlip (self->fd, self->crtc_id, self->buffer_id,
-        DRM_MODE_PAGE_FLIP_EVENT, &waiting);
-    if (ret)
-      goto pageflip_failed;
+#ifdef INTERWORK_AVOUTPUTD
+    if (!self->modesetting_enabled) {
+      // skip flip operation
+      return TRUE;
+    } else {
+#endif
+      ret = drmModePageFlip (self->fd, self->crtc_id, self->buffer_id,
+          DRM_MODE_PAGE_FLIP_EVENT, &waiting);
+      if (ret)
+        goto pageflip_failed;
+#ifdef INTERWORK_AVOUTPUTD
+    }
+#endif
   }
 
   while (waiting) {
@@ -1320,28 +1378,33 @@ gst_kms_sink_copy_to_dumb_buffer (GstKMSSink * self, GstBuffer * inbuf)
   if (ret != GST_FLOW_OK)
     goto create_buffer_failed;
 
+  if (!gst_video_frame_map (&inframe, &self->vinfo, inbuf, GST_MAP_READ))
+    goto error_map_src_buffer;
+
 #ifdef INTERWORK_AVOUTPUTD
-  if (!gst_video_frame_map (&inframe, &self->vinfo, inbuf, GST_MAP_READ))
-    goto error_map_src_buffer;
+  if (!self->modesetting_enabled) {
+    if( self->set_plane_count < 1) {
+      if (!gst_video_frame_map (&self->outframe, &self->vinfo, buf, GST_MAP_WRITE))
+        goto error_map_dst_buffer;
+    }
 
-  if( set_plane_count < 1) {
-    if (!gst_video_frame_map (&self->outframe, &self->vinfo, buf, GST_MAP_WRITE))
-      goto error_map_dst_buffer;
+    success = gst_video_frame_copy (&self->outframe, &inframe);
+  } else {
+    if (!gst_video_frame_map (&outframe, &self->vinfo, buf, GST_MAP_WRITE))
+    goto error_map_dst_buffer;
+
+    success = gst_video_frame_copy (&outframe, &inframe);
+    gst_video_frame_unmap (&outframe);
   }
-
-  success = gst_video_frame_copy (&self->outframe, &inframe);
-  gst_video_frame_unmap (&inframe);
 #else
-  if (!gst_video_frame_map (&inframe, &self->vinfo, inbuf, GST_MAP_READ))
-    goto error_map_src_buffer;
-
   if (!gst_video_frame_map (&outframe, &self->vinfo, buf, GST_MAP_WRITE))
     goto error_map_dst_buffer;
 
   success = gst_video_frame_copy (&outframe, &inframe);
   gst_video_frame_unmap (&outframe);
-  gst_video_frame_unmap (&inframe);
 #endif
+  gst_video_frame_unmap (&inframe);
+
   if (!success)
     goto error_copy_buffer;
 
@@ -1445,15 +1508,15 @@ gst_kms_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
     goto buffer_invalid;
 
   /* For display fps */
-  frame_cnt_in_sec++;
+  self->frame_cnt_in_sec++;
 
   cur_time = g_get_monotonic_time();
 
-  if( cur_time/1000000 != old_time/1000000 ) {
-    GST_INFO_OBJECT (self, "fps: %d", frame_cnt_in_sec);
-    frame_cnt_in_sec = 0;
+  if (GST_TIME_AS_MSECONDS(cur_time) != GST_TIME_AS_MSECONDS(self->old_time) ) {
+    GST_INFO_OBJECT (self, "fps: %d", self->frame_cnt_in_sec);
+    self->frame_cnt_in_sec = 0;
   }
-  old_time = cur_time;
+  self->old_time = cur_time;
 
   GST_TRACE_OBJECT (self, "displaying fb %d", fb_id);
 
@@ -1464,12 +1527,80 @@ gst_kms_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
   }
 
 #ifdef INTERWORK_AVOUTPUTD
-  if( set_plane_count < 1 ) {
-    ret = drmModeObjectSetProperty(self->fd, self->plane_id, DRM_MODE_OBJECT_PLANE, 0xff01, fb_id);
+  if ( !self->modesetting_enabled) {
+    if ( self->set_plane_count < 1 ) {
+      ret = drmModeObjectSetProperty(self->fd, self->plane_id, DRM_MODE_OBJECT_PLANE, 0xff01, fb_id);
+      if (ret) {
+        goto set_plane_failed;
+      }
+      self->set_plane_count++;
+    }
+  } else {
+    if ((crop = gst_buffer_get_video_crop_meta (buffer))) {
+      GstVideoInfo vinfo = self->vinfo;
+      vinfo.width = crop->width;
+      vinfo.height = crop->height;
+
+      if (!gst_kms_sink_calculate_display_ratio (self, &vinfo))
+        goto no_disp_ratio;
+
+      src.x = crop->x;
+      src.y = crop->y;
+    }
+
+    src.w = GST_VIDEO_SINK_WIDTH (self);
+    src.h = GST_VIDEO_SINK_HEIGHT (self);
+
+    dst.w = self->render_rect.w;
+    dst.h = self->render_rect.h;
+
+  retry_set_plane:
+    gst_video_sink_center_rect (src, dst, &result, self->can_scale);
+
+    result.x += self->render_rect.x;
+    result.y += self->render_rect.y;
+
+    if (crop) {
+      src.w = crop->width;
+      src.h = crop->height;
+    } else {
+      src.w = GST_VIDEO_INFO_WIDTH (&self->vinfo);
+      src.h = GST_VIDEO_INFO_HEIGHT (&self->vinfo);
+    }
+
+    /* handle out of screen case */
+    if ((result.x + result.w) > self->hdisplay)
+      result.w = self->hdisplay - result.x;
+
+    if ((result.y + result.h) > self->vdisplay)
+      result.h = self->vdisplay - result.y;
+
+    if (result.w <= 0 || result.h <= 0) {
+      GST_WARNING_OBJECT (self, "video is out of display range");
+      goto sync_frame;
+    }
+
+    /* to make sure it can be show when driver don't support scale */
+    if (!self->can_scale) {
+      src.w = result.w;
+      src.h = result.h;
+    }
+
+    GST_TRACE_OBJECT (self,
+        "drmModeSetPlane at (%i,%i) %ix%i sourcing at (%i,%i) %ix%i",
+        result.x, result.y, result.w, result.h, src.x, src.y, src.w, src.h);
+
+    ret = drmModeSetPlane (self->fd, self->plane_id, self->crtc_id, fb_id, 0,
+        result.x, result.y, result.w, result.h,
+        /* source/cropping coordinates are given in Q16 */
+        src.x << 16, src.y << 16, src.w << 16, src.h << 16);
     if (ret) {
+      if (self->can_scale) {
+        self->can_scale = FALSE;
+        goto retry_set_plane;
+      }
       goto set_plane_failed;
     }
-    set_plane_count++;
   }
 #else
   if ((crop = gst_buffer_get_video_crop_meta (buffer))) {
@@ -1540,13 +1671,11 @@ retry_set_plane:
 #endif
 
 sync_frame:
-#ifndef INTERWORK_AVOUTPUTD
   /* Wait for the previous frame to complete redraw */
   if (!gst_kms_sink_sync (self)) {
     GST_OBJECT_UNLOCK (self);
     goto bail;
   }
-#endif
 
   if (buffer != self->last_buffer)
     gst_buffer_replace (&self->last_buffer, buffer);
@@ -1725,6 +1854,7 @@ gst_kms_sink_init (GstKMSSink * sink)
   sink->conn_id = -1;
   sink->plane_id = -1;
   sink->can_scale = TRUE;
+  sink->saved_crtc = NULL;
   gst_poll_fd_init (&sink->pollfd);
   sink->poll = gst_poll_new (TRUE);
   gst_video_info_init (&sink->vinfo);

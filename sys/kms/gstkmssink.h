@@ -27,6 +27,9 @@
 #define __GST_KMS_SINK_H__
 
 #include <gst/video/gstvideosink.h>
+#include <drm.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
 
 G_BEGIN_DECLS
 
@@ -53,6 +56,8 @@ struct _GstKMSSink {
   gint crtc_id;
   gint plane_id;
   guint pipe;
+
+  drmModeCrtc *saved_crtc;
 
   /* crtc data */
   guint16 hdisplay, vdisplay;
@@ -88,6 +93,10 @@ struct _GstKMSSink {
   /* reconfigure info if driver doesn't scale */
   GstVideoRectangle pending_rect;
   gboolean reconfigure;
+
+  gint64 old_time;
+  gint frame_cnt_in_sec;
+  gint set_plane_count;
 };
 
 struct _GstKMSSinkClass {
