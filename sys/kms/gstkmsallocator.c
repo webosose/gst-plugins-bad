@@ -582,8 +582,9 @@ gst_kms_allocator_dmabuf_export (GstAllocator * allocator, GstMemory * _kmsmem)
   g_return_val_if_fail (kmsmem->bo, NULL);
 
 
+  /* WebOS's DRM driver(old version) doesn't support DRM_RDWR flag. So just remove it */
   ret = drmPrimeHandleToFD (alloc->priv->fd, kmsmem->bo->handle,
-      DRM_CLOEXEC | DRM_RDWR, &prime_fd);
+      DRM_CLOEXEC/* | DRM_RDWR*/, &prime_fd);
   if (ret)
     goto export_fd_failed;
 
