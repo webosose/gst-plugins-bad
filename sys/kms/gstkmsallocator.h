@@ -64,6 +64,7 @@ struct _GstKMSAllocator
 {
   GstAllocator parent;
   GstKMSAllocatorPrivate *priv;
+  gboolean drm_alloc_prop;
 };
 
 struct _GstKMSAllocatorClass {
@@ -97,6 +98,8 @@ void          gst_kms_allocator_cache       (GstAllocator * allocator,
                                              GstMemory * mem,
                                              GstMemory * kmsmem);
 
+void          gst_kms_allocator_set_drm_alloc (GstAllocator * allocator,
+                                               gboolean value);
 G_END_DECLS
 
 

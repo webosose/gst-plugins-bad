@@ -90,6 +90,7 @@ enum
   PROP_CAN_SCALE,
   PROP_DISPLAY_WIDTH,
   PROP_DISPLAY_HEIGHT,
+  PROP_DMA_ALLOC,
   PROP_N
 };
 
@@ -1784,6 +1785,11 @@ gst_kms_sink_set_property (GObject * object, guint prop_id,
     case PROP_CAN_SCALE:
       sink->can_scale = g_value_get_boolean (value);
       break;
+    case PROP_DMA_ALLOC:
+      sink->dma_alloc = g_value_get_boolean(value);
+      if (sink->allocator)
+        gst_kms_allocator_set_drm_alloc(sink->allocator,  sink->dma_alloc);
+      break;
     default:
       if (!gst_video_overlay_set_property (object, PROP_N, prop_id, value))
         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1827,6 +1833,11 @@ gst_kms_sink_get_property (GObject * object, guint prop_id,
       GST_OBJECT_LOCK (sink);
       g_value_set_int (value, sink->vdisplay);
       GST_OBJECT_UNLOCK (sink);
+      break;
+    case PROP_DMA_ALLOC:
+      GST_OBJECT_LOCK (sink);
+      g_value_set_boolean (value, sink->dma_alloc);
+      GST_OBJECT_UNLOCK(sink);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1984,6 +1995,16 @@ gst_kms_sink_class_init (GstKMSSinkClass * klass)
       g_param_spec_int ("display-height", "Display Height",
       "Height of the display surface in pixels", 0, G_MAXINT, 0,
       G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
+
+  /**
+   * kmssink:no-force-allocation
+   *
+   * flag for dma allocation.
+   */
+  g_properties[PROP_DMA_ALLOC] =
+      g_param_spec_boolean ("no-force-allocation", "Forced DMA Allocation",
+      "setting forcefull DMA allocation", TRUE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
 
   g_object_class_install_properties (gobject_class, PROP_N, g_properties);
 

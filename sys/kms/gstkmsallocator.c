@@ -585,7 +585,7 @@ gst_kms_allocator_dmabuf_export (GstAllocator * allocator, GstMemory * _kmsmem)
   /* WebOS's DRM driver(old version) doesn't support DRM_RDWR flag. So just remove it */
   ret = drmPrimeHandleToFD (alloc->priv->fd, kmsmem->bo->handle,
       DRM_CLOEXEC/* | DRM_RDWR*/, &prime_fd);
-  if (ret)
+  if (ret && alloc->drm_alloc_prop)
     goto export_fd_failed;
 
   if (G_UNLIKELY (alloc->priv->dmabuf_alloc == NULL))
@@ -668,4 +668,17 @@ gst_kms_allocator_cache (GstAllocator * allocator, GstMemory * mem,
   gst_mini_object_set_qdata (GST_MINI_OBJECT (mem),
       g_quark_from_static_string ("kmsmem"), kmsmem,
       (GDestroyNotify) gst_memory_unref);
+}
+
+/* @kmsmem setting force dma allocation */
+void
+gst_kms_allocator_set_drm_alloc(GstAllocator * allocator, gboolean value) {
+    GstKMSAllocator *alloc = GST_KMS_ALLOCATOR (allocator);
+
+    GST_OBJECT_LOCK(alloc);
+
+    alloc->drm_alloc_prop = value;
+    GST_DEBUG_OBJECT(alloc, "set drm-alloc to %d", alloc->drm_alloc_prop);
+
+    GST_OBJECT_UNLOCK(alloc);
 }
