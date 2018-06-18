@@ -1033,6 +1033,30 @@ out:
 }
 
 static gboolean
+gst_kms_sink_post_video_info_message (GstKMSSink * self, GstVideoInfo * vinfo)
+{
+  g_return_val_if_fail (self != NULL, FALSE);
+  g_return_val_if_fail (vinfo != NULL, FALSE);
+
+  /*post updated video info message*/
+  GST_DEBUG_OBJECT (self, "new width[%d] height[%d]",
+      GST_VIDEO_INFO_WIDTH(vinfo), GST_VIDEO_INFO_HEIGHT(vinfo));
+
+  /* post an application message as video-info */
+  gboolean ret = FALSE;
+  ret = gst_element_post_message (GST_ELEMENT_CAST (self),
+            gst_message_new_application (GST_OBJECT (self),
+                gst_structure_new ("video-info",
+                    "width", G_TYPE_INT, GST_VIDEO_INFO_WIDTH(vinfo),
+                    "height", G_TYPE_INT, GST_VIDEO_INFO_HEIGHT(vinfo),
+                    "framerate", GST_TYPE_FRACTION, GST_VIDEO_INFO_FPS_N(vinfo),
+                                                    GST_VIDEO_INFO_FPS_D(vinfo),
+                    "par_w", G_TYPE_INT, GST_VIDEO_INFO_PAR_N(vinfo),
+                    "par_h", G_TYPE_INT, GST_VIDEO_INFO_PAR_D(vinfo), NULL)));
+  return ret;
+}
+
+static gboolean
 gst_kms_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
 {
   GstKMSSink *self;
@@ -1054,6 +1078,9 @@ gst_kms_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
 
   if (GST_VIDEO_SINK_WIDTH (self) <= 0 || GST_VIDEO_SINK_HEIGHT (self) <= 0)
     goto invalid_size;
+
+  if (!gst_kms_sink_post_video_info_message(self, &vinfo))
+    goto video_info_failed;
 
   /* create a new pool for the new configuration */
   newpool = gst_kms_sink_create_pool (self, caps, GST_VIDEO_INFO_SIZE (&vinfo),
@@ -1083,6 +1110,20 @@ gst_kms_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
   GST_OBJECT_UNLOCK (self);
 
   GST_DEBUG_OBJECT (self, "negotiated caps = %" GST_PTR_FORMAT, caps);
+
+#ifdef INTERWORK_AVOUTPUTD
+  if (!self->modesetting_enabled) {
+    /* In case of resolution is changed new buffer is getting allocated.
+      Make set_plane_count = 0, to map new buffer to self->outframe in
+      gst_kms_sink_copy_to_dumb_buffer.
+    */
+    if (self->set_plane_count > 0) {
+      GST_DEBUG_OBJECT (self, "unmap outframe, set_plane_count reset to 0");
+      self->set_plane_count = 0;
+      gst_video_frame_unmap (&self->outframe);
+    }
+  }
+#endif
 
   return TRUE;
 
@@ -1119,6 +1160,11 @@ modesetting_failed:
     return FALSE;
   }
 
+video_info_failed:
+  {
+    GST_ERROR_OBJECT (self, "failed to post video info message!");
+    return FALSE;
+  }
 }
 
 static gboolean
@@ -1384,7 +1430,7 @@ gst_kms_sink_copy_to_dumb_buffer (GstKMSSink * self, GstBuffer * inbuf)
 
 #ifdef INTERWORK_AVOUTPUTD
   if (!self->modesetting_enabled) {
-    if( self->set_plane_count < 1) {
+    if ( self->set_plane_count < 1) {
       if (!gst_video_frame_map (&self->outframe, &self->vinfo, buf, GST_MAP_WRITE))
         goto error_map_dst_buffer;
     }
@@ -1527,83 +1573,6 @@ gst_kms_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
     goto sync_frame;
   }
 
-#ifdef INTERWORK_AVOUTPUTD
-  if ( !self->modesetting_enabled) {
-    if ( self->set_plane_count < 1 ) {
-      ret = drmModeObjectSetProperty(self->fd, self->plane_id, DRM_MODE_OBJECT_PLANE, 0xff01, fb_id);
-      if (ret) {
-        goto set_plane_failed;
-      }
-      self->set_plane_count++;
-    }
-  } else {
-    if ((crop = gst_buffer_get_video_crop_meta (buffer))) {
-      GstVideoInfo vinfo = self->vinfo;
-      vinfo.width = crop->width;
-      vinfo.height = crop->height;
-
-      if (!gst_kms_sink_calculate_display_ratio (self, &vinfo))
-        goto no_disp_ratio;
-
-      src.x = crop->x;
-      src.y = crop->y;
-    }
-
-    src.w = GST_VIDEO_SINK_WIDTH (self);
-    src.h = GST_VIDEO_SINK_HEIGHT (self);
-
-    dst.w = self->render_rect.w;
-    dst.h = self->render_rect.h;
-
-  retry_set_plane:
-    gst_video_sink_center_rect (src, dst, &result, self->can_scale);
-
-    result.x += self->render_rect.x;
-    result.y += self->render_rect.y;
-
-    if (crop) {
-      src.w = crop->width;
-      src.h = crop->height;
-    } else {
-      src.w = GST_VIDEO_INFO_WIDTH (&self->vinfo);
-      src.h = GST_VIDEO_INFO_HEIGHT (&self->vinfo);
-    }
-
-    /* handle out of screen case */
-    if ((result.x + result.w) > self->hdisplay)
-      result.w = self->hdisplay - result.x;
-
-    if ((result.y + result.h) > self->vdisplay)
-      result.h = self->vdisplay - result.y;
-
-    if (result.w <= 0 || result.h <= 0) {
-      GST_WARNING_OBJECT (self, "video is out of display range");
-      goto sync_frame;
-    }
-
-    /* to make sure it can be show when driver don't support scale */
-    if (!self->can_scale) {
-      src.w = result.w;
-      src.h = result.h;
-    }
-
-    GST_TRACE_OBJECT (self,
-        "drmModeSetPlane at (%i,%i) %ix%i sourcing at (%i,%i) %ix%i",
-        result.x, result.y, result.w, result.h, src.x, src.y, src.w, src.h);
-
-    ret = drmModeSetPlane (self->fd, self->plane_id, self->crtc_id, fb_id, 0,
-        result.x, result.y, result.w, result.h,
-        /* source/cropping coordinates are given in Q16 */
-        src.x << 16, src.y << 16, src.w << 16, src.h << 16);
-    if (ret) {
-      if (self->can_scale) {
-        self->can_scale = FALSE;
-        goto retry_set_plane;
-      }
-      goto set_plane_failed;
-    }
-  }
-#else
   if ((crop = gst_buffer_get_video_crop_meta (buffer))) {
     GstVideoInfo vinfo = self->vinfo;
     vinfo.width = crop->width;
@@ -1654,6 +1623,61 @@ retry_set_plane:
     src.h = result.h;
   }
 
+#ifdef INTERWORK_AVOUTPUTD
+  if (!self->modesetting_enabled) {
+    if (self->set_plane_count < 1) {
+      typedef struct {
+        /* Signed dest location allows it to be partially off screen */
+        int32_t crtc_x, crtc_y;
+        uint32_t crtc_w, crtc_h;
+
+        /* Source values are 16.16 fixed point */
+        uint32_t src_x, src_y;
+        uint32_t src_h, src_w;
+      } scale_param_t;
+
+      scale_param_t scale_param;
+
+      scale_param.src_x = result.x;
+      scale_param.src_y = result.y;
+      scale_param.src_w = result.w;
+      scale_param.src_h = result.h;
+
+      ret = drmModeObjectSetProperty (self->fd, self->plane_id,
+                DRM_MODE_OBJECT_PLANE, 0xff04, (uint64_t)&scale_param);
+      GST_DEBUG_OBJECT (self, "drmModeObjectSetProperty 0xff04 ret:%d, fd:%d,"
+          "plane_id:%d, (%d,%d,%d,%d)", ret, self->fd, self->plane_id, result.x,
+          result.y, result.w, result.h);
+
+      ret = drmModeObjectSetProperty (self->fd, self->plane_id,
+                                      DRM_MODE_OBJECT_PLANE, 0xff01, fb_id);
+
+      GST_DEBUG_OBJECT (self, "drmModeObjectSetProperty 0xff01 ret:%d, fd:%d,"
+          "plane_id:%d, fb_id:%d", ret, self->fd, self->plane_id, fb_id);
+
+      if (ret) {
+        goto set_plane_failed;
+      }
+      self->set_plane_count++;
+    }
+  } else {
+    GST_TRACE_OBJECT (self,
+        "drmModeSetPlane at (%i,%i) %ix%i sourcing at (%i,%i) %ix%i",
+        result.x, result.y, result.w, result.h, src.x, src.y, src.w, src.h);
+
+    ret = drmModeSetPlane (self->fd, self->plane_id, self->crtc_id, fb_id, 0,
+        result.x, result.y, result.w, result.h,
+        /* source/cropping coordinates are given in Q16 */
+        src.x << 16, src.y << 16, src.w << 16, src.h << 16);
+    if (ret) {
+      if (self->can_scale) {
+        self->can_scale = FALSE;
+        goto retry_set_plane;
+      }
+      goto set_plane_failed;
+    }
+  }
+#else
   GST_TRACE_OBJECT (self,
       "drmModeSetPlane at (%i,%i) %ix%i sourcing at (%i,%i) %ix%i",
       result.x, result.y, result.w, result.h, src.x, src.y, src.w, src.h);
