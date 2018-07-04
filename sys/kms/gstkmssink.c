@@ -59,6 +59,7 @@
 #include "gstkmsallocator.h"
 
 #define INTERWORK_AVOUTPUTD
+//#define INTERWORK_CRTC_MODE
 
 #define GST_PLUGIN_NAME "kmssink"
 #define GST_PLUGIN_DESC "Video sink using the Linux kernel mode setting API"
@@ -93,6 +94,18 @@ enum
   PROP_DMA_ALLOC,
   PROP_N
 };
+
+#ifdef INTERWORK_AVOUTPUTD
+typedef struct {
+  /* Signed dest location allows it to be partially off screen */
+  int32_t crtc_x, crtc_y;
+  uint32_t crtc_w, crtc_h;
+
+  /* Source values are 16.16 fixed point */
+  uint32_t src_x, src_y;
+  uint32_t src_h, src_w;
+} scale_param_t;
+#endif
 
 static GParamSpec *g_properties[PROP_N] = { NULL, };
 
@@ -618,10 +631,18 @@ gst_kms_sink_start (GstBaseSink * bsink)
   if (!conn)
     goto connector_failed;
 
-  self->saved_crtc = find_crtc_for_connector (self->fd, res, conn, &self->pipe);
-  crtc = self->saved_crtc;
+
+  crtc = find_crtc_for_connector (self->fd, res, conn, &self->pipe);
   if (!crtc)
     goto crtc_failed;
+
+#ifdef INTERWORK_CRTC_MODE
+  if (self->modesetting_enabled) {
+    self->saved_crtc = crtc;
+    GST_DEBUG_OBJECT (self, "Save srtc. self->saved_crtc = %p",
+                             self->saved_crtc);
+  }
+#endif
 
   if (!crtc->mode_valid || self->modesetting_enabled) {
     GST_DEBUG_OBJECT (self, "enabling modesetting");
@@ -691,11 +712,21 @@ bail:
     drmModeFreePlane (plane);
   if (pres)
     drmModeFreePlaneResources (pres);
-// will be used to resotre crtc
-#if 0
+
+#ifdef INTERWORK_CRTC_MODE
+  if (self->saved_crtc)
+    goto no_crtc_free;
+
+  // will be used to resotre crtc
+  if (crtc)
+    drmModeFreeCrtc (crtc);
+
+no_crtc_free:
+#else
   if (crtc)
     drmModeFreeCrtc (crtc);
 #endif
+
   if (conn)
     drmModeFreeConnector (conn);
   if (res)
@@ -775,11 +806,11 @@ allowed_caps_failed:
   }
 }
 
+#ifdef INTERWORK_CRTC_MODE
 static gboolean
-restore_saved_crtc (GstBaseSink * bsink)
+gst_kms_sink_reset_saved_crtc (GstBaseSink * bsink)
 {
   GstKMSSink *self;
-  gboolean ret;
   int err;
   gint i;
   guint32 fb_id;
@@ -787,30 +818,35 @@ restore_saved_crtc (GstBaseSink * bsink)
   self = GST_KMS_SINK (bsink);
 
   if (!self->saved_crtc) {
-     GST_ERROR_OBJECT (self, "BK] saved_crtc is NULL");
-
+     GST_ERROR_OBJECT (self, "saved_crtc is NULL");
     return FALSE;
   }
-  ret = FALSE;
 
   if (self->conn_id < 0)
     goto bail;
 
-  err = drmModeSetCrtc (self->fd, self->saved_crtc->crtc_id, self->saved_crtc->buffer_id, self->saved_crtc->x, self->saved_crtc->y,
-    (uint32_t *) & self->conn_id, 1, & self->saved_crtc->mode);
-
-  if (err)
+  err = drmModeSetCrtc (self->fd, self->saved_crtc->crtc_id,
+                        self->saved_crtc->buffer_id, self->saved_crtc->x,
+                        self->saved_crtc->y,
+                        (uint32_t *) & self->conn_id, 1,
+                        & self->saved_crtc->mode);
+  if (err) {
+    GST_DEBUG_OBJECT (self, "drmModeSetCrtc Failed to set mode: %s",
+                            strerror (errno));
     goto modesetting_failed;
-
-  ret = TRUE;
+  } else {
+    GST_DEBUG_OBJECT (self, "drmModeSetCrtc Successfull");
+  }
 
 bail:
   if (self->saved_crtc) {
+    GST_DEBUG_OBJECT (self, "drmModeFreeCrtc self->saved_crtc = %p",
+                            self->saved_crtc);
     drmModeFreeCrtc (self->saved_crtc);
     self->saved_crtc = NULL;
   }
 
-  return ret;
+  return TRUE;
 
   /* ERRORS */
 modesetting_failed:
@@ -819,6 +855,7 @@ modesetting_failed:
     goto bail;
   }
 }
+#endif
 
 static gboolean
 gst_kms_sink_stop (GstBaseSink * bsink)
@@ -827,8 +864,10 @@ gst_kms_sink_stop (GstBaseSink * bsink)
 
   self = GST_KMS_SINK (bsink);
 
-  if (self->saved_crtc && self->modesetting_enabled)
-    restore_saved_crtc (self);
+#ifdef INTERWORK_CRTC_MODE
+  if (self->modesetting_enabled && self->saved_crtc)
+    gst_kms_sink_reset_saved_crtc (self);
+#endif
 
   if (self->allocator)
     gst_kms_allocator_clear_cache (self->allocator);
@@ -1079,9 +1118,6 @@ gst_kms_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
   if (GST_VIDEO_SINK_WIDTH (self) <= 0 || GST_VIDEO_SINK_HEIGHT (self) <= 0)
     goto invalid_size;
 
-  if (!gst_kms_sink_post_video_info_message(self, &vinfo))
-    goto video_info_failed;
-
   /* create a new pool for the new configuration */
   newpool = gst_kms_sink_create_pool (self, caps, GST_VIDEO_INFO_SIZE (&vinfo),
       2);
@@ -1157,12 +1193,6 @@ modesetting_failed:
   {
     GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, (NULL),
         ("failed to configure video mode"));
-    return FALSE;
-  }
-
-video_info_failed:
-  {
-    GST_ERROR_OBJECT (self, "failed to post video info message!");
     return FALSE;
   }
 }
@@ -1437,18 +1467,14 @@ gst_kms_sink_copy_to_dumb_buffer (GstKMSSink * self, GstBuffer * inbuf)
 
     success = gst_video_frame_copy (&self->outframe, &inframe);
   } else {
-    if (!gst_video_frame_map (&outframe, &self->vinfo, buf, GST_MAP_WRITE))
-    goto error_map_dst_buffer;
-
-    success = gst_video_frame_copy (&outframe, &inframe);
-    gst_video_frame_unmap (&outframe);
-  }
-#else
+#endif
   if (!gst_video_frame_map (&outframe, &self->vinfo, buf, GST_MAP_WRITE))
     goto error_map_dst_buffer;
 
   success = gst_video_frame_copy (&outframe, &inframe);
   gst_video_frame_unmap (&outframe);
+#ifdef INTERWORK_AVOUTPUTD
+  }
 #endif
   gst_video_frame_unmap (&inframe);
 
@@ -1626,58 +1652,55 @@ retry_set_plane:
 #ifdef INTERWORK_AVOUTPUTD
   if (!self->modesetting_enabled) {
     if (self->set_plane_count < 1) {
-      typedef struct {
-        /* Signed dest location allows it to be partially off screen */
-        int32_t crtc_x, crtc_y;
-        uint32_t crtc_w, crtc_h;
-
-        /* Source values are 16.16 fixed point */
-        uint32_t src_x, src_y;
-        uint32_t src_h, src_w;
-      } scale_param_t;
-
       scale_param_t scale_param;
+
+      scale_param.crtc_x = 0;
+      scale_param.crtc_y = 0;
+      scale_param.crtc_w = 0;
+      scale_param.crtc_h = 0;
 
       scale_param.src_x = result.x;
       scale_param.src_y = result.y;
       scale_param.src_w = result.w;
       scale_param.src_h = result.h;
 
-      ret = drmModeObjectSetProperty (self->fd, self->plane_id,
+      GST_DEBUG_OBJECT (self, "drmModeObjectSetProperty 0xff04 fd:%d,"
+          "plane_id:%d, source(%d,%d,%d,%d), dest(%d,%d,%d,%d)", self->fd,
+          self->plane_id, scale_param.src_x, scale_param.src_y,
+          scale_param.src_w, scale_param.src_h, scale_param.crtc_x,
+          scale_param.crtc_y, scale_param.crtc_w, scale_param.crtc_h);
+      ret = drmModeObjectSetProperty(self->fd, self->plane_id,
                 DRM_MODE_OBJECT_PLANE, 0xff04, (uint64_t)&scale_param);
-      GST_DEBUG_OBJECT (self, "drmModeObjectSetProperty 0xff04 ret:%d, fd:%d,"
-          "plane_id:%d, (%d,%d,%d,%d)", ret, self->fd, self->plane_id, result.x,
-          result.y, result.w, result.h);
-
-      ret = drmModeObjectSetProperty (self->fd, self->plane_id,
-                                      DRM_MODE_OBJECT_PLANE, 0xff01, fb_id);
-
-      GST_DEBUG_OBJECT (self, "drmModeObjectSetProperty 0xff01 ret:%d, fd:%d,"
-          "plane_id:%d, fb_id:%d", ret, self->fd, self->plane_id, fb_id);
 
       if (ret) {
-        goto set_plane_failed;
+        GST_OBJECT_UNLOCK (self);
+        GST_ELEMENT_ERROR (self, RESOURCE, FAILED, (NULL),
+            ("drmModeObjectSetProperty 0xff04 failed: %s (%d)",
+             strerror (-ret), ret));
+        goto bail;
       }
+
+      GST_DEBUG_OBJECT (self, "drmModeObjectSetProperty 0xff01 fd:%d,"
+          "plane_id:%d, fb_id:%d", self->fd, self->plane_id, fb_id);
+      ret = drmModeObjectSetProperty (self->fd, self->plane_id,
+                                      DRM_MODE_OBJECT_PLANE, 0xff01, fb_id);
+      if (ret) {
+        GST_OBJECT_UNLOCK (self);
+        GST_ELEMENT_ERROR (self, RESOURCE, FAILED, (NULL),
+            ("drmModeObjectSetProperty 0xff01 failed: %s (%d)",
+             strerror (-ret), ret));
+        goto bail;
+      }
+
+      GST_OBJECT_UNLOCK (self);
+      if (!gst_kms_sink_post_video_info_message(self, &self->vinfo))
+        goto video_info_failed;
+      GST_OBJECT_LOCK (self);
+
       self->set_plane_count++;
     }
   } else {
-    GST_TRACE_OBJECT (self,
-        "drmModeSetPlane at (%i,%i) %ix%i sourcing at (%i,%i) %ix%i",
-        result.x, result.y, result.w, result.h, src.x, src.y, src.w, src.h);
-
-    ret = drmModeSetPlane (self->fd, self->plane_id, self->crtc_id, fb_id, 0,
-        result.x, result.y, result.w, result.h,
-        /* source/cropping coordinates are given in Q16 */
-        src.x << 16, src.y << 16, src.w << 16, src.h << 16);
-    if (ret) {
-      if (self->can_scale) {
-        self->can_scale = FALSE;
-        goto retry_set_plane;
-      }
-      goto set_plane_failed;
-    }
-  }
-#else
+#endif
   GST_TRACE_OBJECT (self,
       "drmModeSetPlane at (%i,%i) %ix%i sourcing at (%i,%i) %ix%i",
       result.x, result.y, result.w, result.h, src.x, src.y, src.w, src.h);
@@ -1692,6 +1715,8 @@ retry_set_plane:
       goto retry_set_plane;
     }
     goto set_plane_failed;
+  }
+#ifdef INTERWORK_AVOUTPUTD
   }
 #endif
 
@@ -1737,6 +1762,14 @@ no_disp_ratio:
         ("Error calculating the output display ratio of the video."));
     goto bail;
   }
+#ifdef INTERWORK_AVOUTPUTD
+video_info_failed:
+  {
+    GST_ELEMENT_ERROR (self, CORE, NEGOTIATION, (NULL),
+        (self, "failed to post video info message!"));
+    goto bail;
+  }
+#endif
 }
 
 static void
@@ -1889,7 +1922,9 @@ gst_kms_sink_init (GstKMSSink * sink)
   sink->conn_id = -1;
   sink->plane_id = -1;
   sink->can_scale = TRUE;
+#ifdef INTERWORK_CRTC_MODE
   sink->saved_crtc = NULL;
+#endif
   gst_poll_fd_init (&sink->pollfd);
   sink->poll = gst_poll_new (TRUE);
   gst_video_info_init (&sink->vinfo);
