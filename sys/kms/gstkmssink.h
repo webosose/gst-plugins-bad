@@ -70,7 +70,7 @@ struct _GstKMSSink {
   gboolean can_scale;
 
   gboolean modesetting_enabled;
-  gboolean dma_alloc;
+
   GstVideoInfo vinfo;
   GstCaps *allowed_caps;
   GstBufferPool *pool;
