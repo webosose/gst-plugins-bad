@@ -487,7 +487,6 @@ AG_GST_CHECK_PLUGIN(videoparsers)
 AG_GST_CHECK_PLUGIN(videosignal)
 AG_GST_CHECK_PLUGIN(vmnc)
 AG_GST_CHECK_PLUGIN(y4m)
-AG_GST_CHECK_PLUGIN(yadif)
 
 dnl *** plug-ins to exclude ***
 
@@ -2561,7 +2560,6 @@ gst/videoparsers/Makefile
 gst/videosignal/Makefile
 gst/vmnc/Makefile
 gst/y4m/Makefile
-gst/yadif/Makefile
 gst/compositor/Makefile
 gst-libs/Makefile
 gst-libs/gst/Makefile
